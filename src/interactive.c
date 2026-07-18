@@ -1,140 +1,267 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "mlx_submit.h"
 
-/* Prompt helper: shows prompt, reads line into dst (trims newline) */
+/* -----------------------------------------------------------------------
+ * Safe print-and-flush: always flush before any fgets call so the
+ * terminal actually shows the prompt before blocking on input.
+ * ----------------------------------------------------------------------- */
+static void print_prompt(const char *s) {
+    fputs(s, stdout);
+    fflush(stdout);
+}
+
+/* Discard leftover bytes in stdin (e.g. after a too-long line) */
+static void stdin_flush(void) {
+    int c;
+    /* Only drain if there are leftover bytes — don't block */
+    while ((c = getchar_unlocked ? getchar_unlocked() : getchar()) != '\n'
+           && c != EOF)
+        ;
+}
+
+/* Read one line from stdin into buf[bufsz].
+ * Returns actual length (0 = empty / just Enter).
+ * Handles lines longer than bufsz by draining the rest. */
+static size_t readline(char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    if (!fgets(buf, (int)bufsz, stdin)) return 0;
+
+    size_t len = strlen(buf);
+
+    if (len > 0 && buf[len - 1] == '\n') {
+        buf[--len] = '\0';
+    } else if (len == bufsz - 1) {
+        /* Line was too long — drain remainder so next prompt isn't poisoned */
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF)
+            ;
+    }
+    return len;
+}
+
+/* -----------------------------------------------------------------------
+ * prompt(): show label + optional [default], read one line.
+ * If user just hits Enter and def is set, copies def into dst.
+ * ----------------------------------------------------------------------- */
 static void prompt(const char *label, const char *def,
                    char *dst, size_t dstsz) {
+    char buf[256];
     if (def && def[0])
-        printf("  %s [%s]: ", label, def);
+        snprintf(buf, sizeof(buf), "  %s [%s]: ", label, def);
     else
-        printf("  %s: ", label);
-    fflush(stdout);
+        snprintf(buf, sizeof(buf), "  %s: ", label);
 
-    char line[2048];
-    if (!fgets(line, sizeof(line), stdin)) { dst[0] = '\0'; return; }
+    print_prompt(buf);              /* flush included */
 
-    /* Strip newline */
-    size_t len = strlen(line);
-    if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
+    char line[FIELD_LG];
+    size_t len = readline(line, sizeof(line));
 
     if (len == 0 && def && def[0]) {
         strncpy(dst, def, dstsz - 1);
-        dst[dstsz - 1] = '\0';
     } else {
         strncpy(dst, line, dstsz - 1);
-        dst[dstsz - 1] = '\0';
     }
+    dst[dstsz - 1] = '\0';
 }
 
-/* Same as prompt but does NOT fall back to default if empty — keeps asking */
+/* -----------------------------------------------------------------------
+ * prompt_required(): like prompt() but loops until non-empty input.
+ * ----------------------------------------------------------------------- */
 static void prompt_required(const char *label, char *dst, size_t dstsz) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "  %s (required): ", label);
+
     while (1) {
-        printf("  %s (required): ", label);
-        fflush(stdout);
-        char line[2048];
-        if (!fgets(line, sizeof(line), stdin)) continue;
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
+        print_prompt(buf);
+
+        char line[FIELD_LG];
+        size_t len = readline(line, sizeof(line));
         if (len > 0) {
             strncpy(dst, line, dstsz - 1);
             dst[dstsz - 1] = '\0';
             return;
         }
-        printf("  [!] This field is required, please enter a value.\n");
+        fputs("  [!] This field cannot be empty.\n", stdout);
+        fflush(stdout);
     }
 }
 
-int interactive_fill(struct manifest *m, char *local_file, size_t lf_sz) {
-    printf("\n\u2554");
-    for (int i = 0; i < 38; i++) printf("\u2550");
-    printf("\u2557\n");
-    printf(  "\u2551   mlx-pkg-submit \u2014 interactive mode  \u2551\n");
-    printf(  "\u255a");
-    for (int i = 0; i < 38; i++) printf("\u2550");
-    printf("\u255d\n\n");
-    printf("Leave blank to keep the default value shown in [brackets].\n");
-    printf("Fields marked (required) must not be empty.\n\n");
+/* -----------------------------------------------------------------------
+ * prompt_choice(): like prompt_required() but validates against a set.
+ * choices is a NULL-terminated array of valid strings.
+ * ----------------------------------------------------------------------- */
+static void prompt_choice(const char *label, const char *def,
+                          const char **choices,
+                          char *dst, size_t dstsz) {
+    char line[FIELD_SM];
+    while (1) {
+        char buf[256];
+        if (def && def[0])
+            snprintf(buf, sizeof(buf), "  %s [%s]: ", label, def);
+        else
+            snprintf(buf, sizeof(buf), "  %s: ", label);
 
-    /* --- Required fields --- */
+        print_prompt(buf);
+        size_t len = readline(line, sizeof(line));
+
+        const char *val = (len == 0 && def && def[0]) ? def : line;
+
+        /* Validate */
+        int ok = 0;
+        for (int i = 0; choices[i]; i++) {
+            if (strcasecmp(val, choices[i]) == 0) {
+                /* Store canonical lowercase version */
+                strncpy(dst, choices[i], dstsz - 1);
+                dst[dstsz - 1] = '\0';
+                ok = 1;
+                break;
+            }
+        }
+        if (ok) return;
+
+        fputs("  [!] Invalid choice. Valid options: ", stdout);
+        for (int i = 0; choices[i]; i++) {
+            fputs(choices[i], stdout);
+            if (choices[i + 1]) fputs(" | ", stdout);
+        }
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Draw the header box using plain ASCII (avoids UTF-8 width issues
+ * that cause the "garbage first char" bug on some terminals/locales).
+ * ----------------------------------------------------------------------- */
+static void draw_header(void) {
+    puts("");
+    puts("+--------------------------------------+");
+    puts("|  mlx-pkg-submit - interactive mode   |");
+    puts("+--------------------------------------+");
+    puts("");
+    puts("Leave blank to keep the default shown in [brackets].");
+    puts("Fields marked (required) must not be empty.");
+    puts("");
+    fflush(stdout);
+}
+
+/* -----------------------------------------------------------------------
+ * Public entry point
+ * ----------------------------------------------------------------------- */
+int interactive_fill(struct manifest *m, char *local_file, size_t lf_sz) {
+    draw_header();
+
+    static const char *CATEGORIES[] = {
+        "system", "internet", "desktop", "devel",
+        "media", "games", "utils", NULL
+    };
+    static const char *INSTALL_TYPES[] = {
+        "rpm", "tarball", "appimage", "flatpak", NULL
+    };
+
+    /* Package name */
     if (!m->name[0])
         prompt_required("Package name", m->name, sizeof(m->name));
     else
         prompt("Package name", m->name, m->name, sizeof(m->name));
 
+    /* Version */
     if (!m->version[0])
         prompt_required("Version", m->version, sizeof(m->version));
     else
         prompt("Version", m->version, m->version, sizeof(m->version));
 
-    char rel_str[8];
+    /* Release */
+    char rel_str[16];
     snprintf(rel_str, sizeof(rel_str), "%d", m->release ? m->release : 1);
-    char rel_in[32] = {0};
+    char rel_in[16] = {0};
     prompt("Release number", rel_str, rel_in, sizeof(rel_in));
-    if (rel_in[0]) m->release = atoi(rel_in);
-    else if (!m->release) m->release = 1;
-
-    /* --- Category: SEPARATE prompt, never skipped --- */
-    printf("  Categories: system | internet | desktop | devel | media | games | utils\n");
-    if (!m->category[0]) {
-        prompt_required("Category", m->category, sizeof(m->category));
-    } else {
-        /* Show current and allow change */
-        char cat_in[FIELD_SM] = {0};
-        printf("  Category [%s]: ", m->category);
-        fflush(stdout);
-        char line[256];
-        if (fgets(line, sizeof(line), stdin)) {
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
-            if (len > 0) strncpy(m->category, line, sizeof(m->category) - 1);
-        }
+    /* Validate: must be numeric */
+    if (rel_in[0]) {
+        int valid = 1;
+        for (int i = 0; rel_in[i]; i++)
+            if (!isdigit((unsigned char)rel_in[i])) { valid = 0; break; }
+        m->release = valid ? atoi(rel_in) : 1;
+    } else if (!m->release) {
+        m->release = 1;
     }
 
+    /* Category (validated against known values) */
+    puts("  Categories: system | internet | desktop | devel | media | games | utils");
+    fflush(stdout);
+    prompt_choice("Category",
+                  m->category[0] ? m->category : NULL,
+                  CATEGORIES,
+                  m->category, sizeof(m->category));
+
+    /* Summary */
     if (!m->summary[0])
         prompt_required("Short summary", m->summary, sizeof(m->summary));
     else
         prompt("Short summary", m->summary, m->summary, sizeof(m->summary));
 
-    prompt("Description (opt)",   m->description, m->description, sizeof(m->description));
+    /* Description */
+    prompt("Description (opt)", m->description, m->description,
+           sizeof(m->description));
 
+    /* License */
     if (!m->license[0])
-        prompt_required("SPDX License", m->license, sizeof(m->license));
+        prompt_required("SPDX License (e.g. GPL-3.0, MIT, MPL-2.0)",
+                        m->license, sizeof(m->license));
     else
         prompt("SPDX License", m->license, m->license, sizeof(m->license));
 
+    /* Download URL */
     if (!m->url[0])
         prompt_required("Download URL", m->url, sizeof(m->url));
     else
         prompt("Download URL", m->url, m->url, sizeof(m->url));
 
-    printf("  Provide local file path to hash (faster), or leave empty to download:\n");
+    /* Local file for hashing */
+    puts("  Provide local file path to hash (faster), or leave empty to download:");
+    fflush(stdout);
     prompt("Local file path (opt)", "", local_file, lf_sz);
 
-    printf("  Install types: rpm | tarball | appimage | flatpak\n");
-    prompt("Install type",
-           m->install_type[0] ? m->install_type : "rpm",
-           m->install_type, sizeof(m->install_type));
-    if (!m->install_type[0]) strncpy(m->install_type, "rpm", sizeof(m->install_type) - 1);
+    /* Install type (validated) */
+    puts("  Install types: rpm | tarball | appimage | flatpak");
+    fflush(stdout);
+    prompt_choice("Install type",
+                  m->install_type[0] ? m->install_type : "rpm",
+                  INSTALL_TYPES,
+                  m->install_type, sizeof(m->install_type));
 
+    /* Architecture */
     prompt("Architecture",
            m->arch[0] ? m->arch : "x86_64",
            m->arch, sizeof(m->arch));
     if (!m->arch[0]) strncpy(m->arch, "x86_64", sizeof(m->arch) - 1);
 
+    /* Dependencies */
     prompt("Dependencies (comma-separated, opt)",
            m->deps_raw, m->deps_raw, sizeof(m->deps_raw));
 
+    /* Maintainer */
     if (!m->maintainer[0])
-        prompt_required("Maintainer email", m->maintainer, sizeof(m->maintainer));
+        prompt_required("Maintainer email", m->maintainer,
+                        sizeof(m->maintainer));
     else
-        prompt("Maintainer email", m->maintainer, m->maintainer, sizeof(m->maintainer));
+        prompt("Maintainer email", m->maintainer, m->maintainer,
+               sizeof(m->maintainer));
 
-    prompt("Homepage URL (opt)",  m->homepage,   m->homepage,   sizeof(m->homepage));
-    prompt("Source URL (opt)",    m->source_url, m->source_url, sizeof(m->source_url));
+    /* Homepage */
+    prompt("Homepage URL (opt)", m->homepage, m->homepage,
+           sizeof(m->homepage));
 
-    printf("\n[*] Fields collected.\n");
+    /* Source URL */
+    prompt("Source URL (opt)", m->source_url, m->source_url,
+           sizeof(m->source_url));
+
+    puts("");
+    puts("[*] Fields collected.");
+    fflush(stdout);
     return 0;
 }
