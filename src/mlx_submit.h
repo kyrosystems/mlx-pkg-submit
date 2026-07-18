@@ -44,3 +44,10 @@ int github_submit(const struct manifest *m, const char *json,
 
 /* interactive.c */
 int interactive_fill(struct manifest *m, char *local_file, size_t lf_sz);
+
+/* batch.c */
+int batch_submit(const char **files, int count,
+                 const char *token, const char *repo);
+
+/* init.c */
+int init_template(const char *output_path);

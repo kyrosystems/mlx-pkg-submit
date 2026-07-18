@@ -6,7 +6,7 @@
 
 #include "mlx_submit.h"
 
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 #define TARGET_REPO "kyrosystems/makulinux-packages"
 
 static void print_usage(const char *prog) {
@@ -29,6 +29,10 @@ static void print_usage(const char *prog) {
         "  -i, --interactive         Interactive mode\n"
         "  -T, --token <token>       GitHub token (or GITHUB_TOKEN env var)\n"
         "  -D, --dry-run             Print JSON, don't submit\n"
+        "  -I, --init <path>         Create a blank template manifest at <path>\n"
+        "                            Parent directories are created automatically.\n"
+        "  -b, --batch <f1> [f2...]  Submit multiple pre-rendered JSON manifest\n"
+        "                            files at once (must come after all other flags).\n"
         "  -h, --help                Show this help\n"
         "  -V, --version-info        Show version\n",
         prog);
@@ -44,8 +48,10 @@ int main(int argc, char *argv[]) {
     char local_file[1024] = {0};
     char output_file[1024] = {0};
     char github_token[256] = {0};
+    char init_path[4096] = {0};
     int interactive = 0;
     int dry_run = 0;
+    int do_batch = 0;
 
     /* Check GITHUB_TOKEN env */
     const char *env_token = getenv("GITHUB_TOKEN");
@@ -56,29 +62,31 @@ int main(int argc, char *argv[]) {
     if (env_maint) strncpy(m.maintainer, env_maint, sizeof(m.maintainer) - 1);
 
     static struct option long_opts[] = {
-        {"name",        required_argument, 0, 'n'},
-        {"version",     required_argument, 0, 'v'},
-        {"release",     required_argument, 0, 'r'},
-        {"category",    required_argument, 0, 'c'},
-        {"url",         required_argument, 0, 'u'},
-        {"file",        required_argument, 0, 'f'},
-        {"summary",     required_argument, 0, 's'},
-        {"license",     required_argument, 0, 'l'},
-        {"maintainer",  required_argument, 0, 'm'},
-        {"homepage",    required_argument, 0, 'H'},
-        {"deps",        required_argument, 0, 'd'},
-        {"type",        required_argument, 0, 't'},
-        {"output",      required_argument, 0, 'o'},
-        {"interactive", no_argument,       0, 'i'},
-        {"token",       required_argument, 0, 'T'},
-        {"dry-run",     no_argument,       0, 'D'},
-        {"help",        no_argument,       0, 'h'},
-        {"version-info",no_argument,       0, 'V'},
+        {"name",         required_argument, 0, 'n'},
+        {"version",      required_argument, 0, 'v'},
+        {"release",      required_argument, 0, 'r'},
+        {"category",     required_argument, 0, 'c'},
+        {"url",          required_argument, 0, 'u'},
+        {"file",         required_argument, 0, 'f'},
+        {"summary",      required_argument, 0, 's'},
+        {"license",      required_argument, 0, 'l'},
+        {"maintainer",   required_argument, 0, 'm'},
+        {"homepage",     required_argument, 0, 'H'},
+        {"deps",         required_argument, 0, 'd'},
+        {"type",         required_argument, 0, 't'},
+        {"output",       required_argument, 0, 'o'},
+        {"interactive",  no_argument,       0, 'i'},
+        {"token",        required_argument, 0, 'T'},
+        {"dry-run",      no_argument,       0, 'D'},
+        {"init",         required_argument, 0, 'I'},
+        {"batch",        no_argument,       0, 'b'},
+        {"help",         no_argument,       0, 'h'},
+        {"version-info", no_argument,       0, 'V'},
         {0, 0, 0, 0}
     };
 
     int opt, optidx = 0;
-    while ((opt = getopt_long(argc, argv, "n:v:r:c:u:f:s:l:m:H:d:t:o:T:iDhV",
+    while ((opt = getopt_long(argc, argv, "n:v:r:c:u:f:s:l:m:H:d:t:o:T:I:iDbDhV",
                               long_opts, &optidx)) != -1) {
         switch (opt) {
             case 'n': strncpy(m.name,        optarg, sizeof(m.name) - 1);        break;
@@ -95,14 +103,50 @@ int main(int argc, char *argv[]) {
             case 't': strncpy(m.install_type,optarg, sizeof(m.install_type) - 1);break;
             case 'o': strncpy(output_file,   optarg, sizeof(output_file) - 1);   break;
             case 'T': strncpy(github_token,  optarg, sizeof(github_token) - 1);  break;
+            case 'I': strncpy(init_path,     optarg, sizeof(init_path) - 1);     break;
             case 'i': interactive = 1;                                            break;
             case 'D': dry_run = 1;                                                break;
+            case 'b': do_batch = 1;                                               break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V': printf("mlx-pkg-submit " VERSION "\n"); return 0;
             default:  print_usage(argv[0]); return 1;
         }
     }
 
+    /* ------------------------------------------------------------------ */
+    /* Mode: --init — just write a blank template and exit                 */
+    /* ------------------------------------------------------------------ */
+    if (init_path[0]) {
+        return init_template(init_path);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Mode: --batch — submit all remaining positional args as JSON files  */
+    /* ------------------------------------------------------------------ */
+    if (do_batch) {
+        int remaining = argc - optind;
+        if (remaining <= 0) {
+            fprintf(stderr,
+                "[error] --batch requires at least one manifest file path.\n"
+                "        Usage: %s --batch [OPTIONS] file1.json file2.json ...\n",
+                argv[0]);
+            return 1;
+        }
+
+        if (!github_token[0]) {
+            fprintf(stderr, "[error] No GitHub token. Use -T or set GITHUB_TOKEN.\n");
+            return 1;
+        }
+
+        const char **batch_files = (const char **)&argv[optind];
+        int failures = batch_submit(batch_files, remaining,
+                                    github_token, TARGET_REPO);
+        return failures > 0 ? 1 : 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Mode: single-package submission (original behaviour)               */
+    /* ------------------------------------------------------------------ */
     if (interactive) {
         if (interactive_fill(&m, local_file, sizeof(local_file)) != 0) {
             fprintf(stderr, "[error] Interactive mode failed.\n");
@@ -113,7 +157,7 @@ int main(int argc, char *argv[]) {
     /* Validate required fields */
     if (!m.name[0] || !m.version[0] || !m.url[0] || !m.category[0]) {
         fprintf(stderr, "[error] Required: --name, --version, --url, --category\n"
-                        "        Use -i for interactive mode.\n");
+                        "        Use -i for interactive mode or --batch for bulk.\n");
         return 1;
     }
 
