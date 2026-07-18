@@ -110,25 +110,42 @@ int github_submit(const struct manifest *m, const char *json_content,
         if (resp) { fprintf(stderr, "%s\n", resp); free(resp); }
         return -1;
     }
+    
     char base_sha[64] = {0};
-    const char *sha_p = strstr(resp, "\"sha\":");
-    if (sha_p) {
-        sha_p += 7;
-        if (*sha_p == '"') sha_p++;
-        size_t k = 0;
-        while (sha_p[k] && sha_p[k] != '"' && k < 63) { base_sha[k]=sha_p[k]; k++; }
-        base_sha[k] = '\0';
+    if (json_get_str(resp, "sha", base_sha, sizeof(base_sha)) != 0) {
+        const char *sha_p = strstr(resp, "\"sha\":");
+        if (sha_p) {
+            sha_p += 6;
+            while (*sha_p == ' ' || *sha_p == '"') sha_p++;
+            size_t k = 0;
+            while (sha_p[k] && sha_p[k] != '"' && sha_p[k] != ',' && sha_p[k] != '}' && k < 63) { 
+                base_sha[k] = sha_p[k]; 
+                k++; 
+            }
+            base_sha[k] = '\0';
+        }
     }
     free(resp); resp = NULL;
-    if (!base_sha[0]) { fprintf(stderr, "[github] Could not parse main SHA\n"); return -1; }
+    
+    if (!base_sha[0] || strlen(base_sha) < 40) { 
+        fprintf(stderr, "[github] Could not parse main SHA\n"); 
+        return -1; 
+    }
     printf("[github] main SHA: %.12s...\n", base_sha);
 
     /* --- Step 2: Create branch pkg/<name_lc>-<version> --- */
     char branch[128];
     snprintf(branch, sizeof(branch), "pkg/%s-%s", name_lc, m->version);
 
+    for (int i = 0; branch[i]; i++) {
+        if (branch[i] == ' ' || branch[i] == '\\' || branch[i] == '"') {
+            branch[i] = '-'; 
+        }
+    }
+
     snprintf(req_body, sizeof(req_body),
         "{\"ref\":\"refs/heads/%s\",\"sha\":\"%s\"}", branch, base_sha);
+        
     snprintf(endpoint, sizeof(endpoint), "/repos/%s/git/refs", repo);
     if (http_github_api("POST", endpoint, token, req_body, &resp, &http_code) != 0) {
         fprintf(stderr, "[github] Network error creating branch\n");
